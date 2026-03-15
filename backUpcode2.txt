@@ -1,0 +1,173 @@
+from playwright.sync_api import sync_playwright, TimeoutError
+import csv
+
+def extract_cafe_data(page):
+    """
+    Extracts cafe information from the details page using faster and more specific selectors.
+    """
+    data = {
+        'name': 'Not found',
+        'rating': 'Not found',
+        'reviews_count': 'Not found',
+        'address': 'Not found',
+        'phone': 'Not found',
+        'website': 'Not found',
+        'opening_hours': 'Not found'
+    }
+
+    try:
+        # 1. Extract Name - More specific selector to avoid grabbing "Recent"
+        try:
+            # This targets the H1 element whose class contains "fontHeadlineLarge"
+            name_element = page.locator('h1[class*="fontHeadlineLarge"]').first
+            name_element.wait_for(state="visible", timeout=3000)
+            data['name'] = name_element.inner_text().strip()
+        except TimeoutError:
+            print(f"Warning: Cafe name not found.")
+
+        # 2. Extract Rating & Reviews - More reliable selector
+        try:
+            # Target the button with the aria-label containing "stars"
+            rating_container = page.locator('button[aria-label*="stars"]').first
+            rating_container.wait_for(state="visible", timeout=2000)
+            
+            # The rating and review count are inside a div within this button
+            full_text = rating_container.locator('div').first.inner_text().strip()
+            parts = full_text.split()
+            if len(parts) >= 2:
+                data['rating'] = parts[0]
+                # Join the remaining parts for reviews, removing parentheses
+                data['reviews_count'] = ''.join(parts[1:]).replace('(', '').replace(')', '').replace(',', '')
+        except TimeoutError:
+            print(f"Warning: Rating/Reviews not found for {data['name']}.")
+
+        # 3. Extract Address, Phone, Website using stable `data-item-id`
+        try:
+            address_element = page.locator('button[data-item-id="address"]').first
+            data['address'] = address_element.get_attribute('aria-label').replace('Address:', '').strip()
+        except TimeoutError:
+            pass # Silently fail if not found
+
+        try:
+            phone_element = page.locator('button[data-item-id^="phone:tel:"]').first
+            data['phone'] = phone_element.get_attribute('aria-label').replace('Phone:', '').strip()
+        except TimeoutError:
+            pass # Silently fail if not found
+            
+        try:
+            website_element = page.locator('a[data-item-id="authority"]').first
+            data['website'] = website_element.get_attribute('href')
+        except TimeoutError:
+            pass # Silently fail if not found
+
+        # 4. Extract Opening Hours - Finds the detailed schedule
+        try:
+            # The hours are often within a div with a specific role and aria-label
+            hours_element = page.locator('div[aria-label*="Opening hours"]').first
+            hours_element.wait_for(state="visible", timeout=2000)
+            # We get the first line of the inner text which usually contains the current day's status
+            full_hours_text = hours_element.inner_text().strip().split('\n')[0]
+            data['opening_hours'] = full_hours_text
+        except TimeoutError:
+            print(f"Warning: Opening hours not found for {data['name']}.")
+
+    except Exception as e:
+        print(f"An unexpected error occurred during extraction: {e}")
+
+    return data
+
+
+def scrape_cafes(search_term="cafe near bhubaneswar", max_results=10):
+    """Main scraping function with optimized wait times."""
+    with sync_playwright() as p:
+        print("Launching browser...")
+        # Reduce slow_mo for faster execution
+        browser = p.chromium.launch(headless=False, slow_mo=50)
+        page = browser.new_page()
+
+        try:
+            print("Opening Google Maps...")
+            page.goto('https://www.google.com/maps', timeout=60000)
+
+            print(f"Searching for: {search_term}")
+            page.locator('input#searchboxinput').fill(search_term)
+            page.locator('button#searchbox-searchbutton').click()
+
+            # Wait for the scrollable list of results to appear
+            print("Waiting for search results feed...")
+            results_feed_selector = 'div[role="feed"]'
+            page.wait_for_selector(results_feed_selector, timeout=10000)
+
+            # Scroll down a bit to load more results if needed
+            page.evaluate(f'document.querySelector("{results_feed_selector}").scrollTop = 500;')
+            
+            listings = page.locator(f'{results_feed_selector} a[href*="/maps/place/"]').all()
+            print(f"Found {len(listings)} initial cafe listings.")
+
+            results = []
+            if not listings:
+                print("No listings found. The page structure may have changed.")
+                return []
+
+            for i in range(min(max_results, len(listings))):
+                listing = listings[i]
+                print(f"\nScraping cafe #{i+1}...")
+
+                try:
+                    listing.click()
+                    # DYNAMIC WAIT: Wait for the main title to appear before scraping
+                    page.wait_for_selector('h1[class*="fontHeadlineLarge"]', state="visible", timeout=7000)
+                    
+                    cafe_data = extract_cafe_data(page)
+                    cafe_data['search_rank'] = i + 1
+                    
+                    if cafe_data['name'] != 'Not found':
+                        print(f"✓ Scraped: {cafe_data['name']} ({cafe_data['rating']} stars)")
+                        results.append(cafe_data)
+                    else:
+                        print(f"✗ Failed to scrape essential data for cafe #{i+1}.")
+
+                except Exception as e:
+                    print(f"✗ Could not process listing #{i+1}: {e}")
+                    continue
+
+        except TimeoutError:
+            print("Error: Timed out waiting for a critical page element. Check selectors or network.")
+        except Exception as e:
+            print(f"A critical error occurred: {e}")
+        finally:
+            print("\nClosing browser.")
+            browser.close()
+
+        return results
+
+
+def save_to_csv(data, filename='cafes_bhubaneswar_fast.csv'):
+    """Save scraped data to a CSV file"""
+    if not data:
+        print("No data was scraped to save.")
+        return
+
+    fieldnames = ['search_rank', 'name', 'rating', 'reviews_count', 'address', 'phone', 'website', 'opening_hours']
+    
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(data)
+
+    print(f"\n✓ Data for {len(data)} cafes saved to {filename}")
+
+
+if __name__ == "__main__":
+    SEARCH_TERM = "cafe near Bhubaneswar"
+    MAX_RESULTS = 10
+    OUTPUT_FILE = "cafes_bhubaneswar_fast.csv"
+    
+    print("=" * 40)
+    print("=== Google Maps Cafe Scraper (Fast & Accurate) ===")
+    print("=" * 40)
+    
+    scraped_data = scrape_cafes(SEARCH_TERM, MAX_RESULTS)
+    save_to_csv(scraped_data, OUTPUT_FILE)
+
+    print("\n=== Scraping Complete ===")
